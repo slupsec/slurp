@@ -1,0 +1,20 @@
+[package]
+name = "mcp-server"
+version.workspace = true
+license.workspace = true
+edition = "2021"
+
+[dependencies]
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+reqwest = { workspace = true }
+tracing = { workspace = true }
+anyhow = { workspace = true }
+rustls = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+axum = { workspace = true }
+proxy-core = { path = "../proxy-core" }
+web-server = { path = "../web-server" }

@@ -1,0 +1,1479 @@
+import { crawl } from "./crawler";
+import { businessKind } from "./business-checks";
+import { scanParameters } from "../scan-selection";
+import { defaultScanPolicy, validatePolicy, policyReason } from "./registry";
+import { flowId } from "../flows";
+import { compareResponses, defaultDiffOptions } from "../response-diff";
+import { validateFinalRequest } from "../intruder";
+import { getScanCheck } from "./checks";
+import { withoutCredentials } from "./http-checks";
+import { isFormRequest, mutateParameter, parameterKey, withHeader } from "./parameters";
+import type { HttpRequest } from "../traffic";
+import type {
+  CheckId,
+  CheckResult,
+  DiscoveredEndpoint,
+  Exchange,
+  Finding,
+  ScanEvidence,
+  ScanPlan,
+  ScanResponse,
+  ScanRun,
+} from "./types";
+export function newScanPlan(request: HttpRequest): ScanPlan {
+  return {
+    request: structuredClone(request),
+    mode: "passive",
+    policy: { ...defaultScanPolicy },
+    checks: [
+      "cookie-flags",
+      "error-disclosure",
+      "security-headers",
+      "passive-audit",
+      "cookie-audit",
+      "disclosure-audit",
+      "policy-audit",
+    ],
+    parameters: [],
+    allowSending: false,
+    baselineSamples: 2,
+    rate: 2,
+    delay: 0,
+    diffOptions: structuredClone(defaultDiffOptions),
+  };
+}
+export function validateScanPlan(plan: ScanPlan) {
+  validateFinalRequest(plan.request);
+  if (plan.crawlBeforeScan !== undefined && typeof plan.crawlBeforeScan !== "boolean")
+    throw Error("Invalid crawl option.");
+  if (plan.crawlBeforeScan && !plan.allowSending)
+    throw Error("Crawling requires permission to send requests.");
+  if (plan.jsEndpointScan !== undefined && typeof plan.jsEndpointScan !== "boolean")
+    throw Error("Invalid JavaScript endpoint option.");
+  if (plan.jsEndpointScan && !plan.allowSending)
+    throw Error("Following JavaScript endpoints requires permission to send requests.");
+  if (
+    plan.jsEndpointOptions &&
+    (!Number.isInteger(plan.jsEndpointOptions.maxEndpoints) ||
+      plan.jsEndpointOptions.maxEndpoints < 1 ||
+      plan.jsEndpointOptions.maxEndpoints > 20)
+  )
+    throw Error("JavaScript endpoint limit: 1–20 endpoints.");
+  if (
+    plan.crawlOptions &&
+    (!Number.isInteger(plan.crawlOptions.maxUrls) ||
+      plan.crawlOptions.maxUrls < 1 ||
+      plan.crawlOptions.maxUrls > 50 ||
+      !Number.isInteger(plan.crawlOptions.maxDepth) ||
+      plan.crawlOptions.maxDepth < 0 ||
+      plan.crawlOptions.maxDepth > 5)
+  )
+    throw Error("Crawl limits: 1–50 URLs and depth 0–5.");
+  if (
+    plan.jwtPublicKey !== undefined &&
+    (typeof plan.jwtPublicKey !== "string" ||
+      plan.jwtPublicKey.length > 16000 ||
+      /PRIVATE KEY/.test(plan.jwtPublicKey))
+  )
+    throw Error("JWT key must be a public PEM, at most 16 KB; private keys are not accepted.");
+  if (plan.businessReadback) {
+    const config = plan.businessReadback;
+    const url = new URL(config.url);
+    if (
+      url.origin !== new URL(plan.request.url).origin ||
+      url.username ||
+      url.password ||
+      url.hash ||
+      typeof config.parameter !== "string" ||
+      config.parameter.length > 2000 ||
+      !scanParameters(plan.request).some((p) => parameterKey(p) === config.parameter) ||
+      typeof config.pointer !== "string" ||
+      config.pointer.length > 2000 ||
+      (config.pointer !== "" && !/^(?:\/(?:[^~]|~[01])*)+$/.test(config.pointer))
+    )
+      throw Error(
+        "Business read-back requires a same-origin URL, parameter and valid JSON pointer.",
+      );
+  }
+  if (plan.policy) validatePolicy(plan.policy);
+  if (!["passive", "active", "both"].includes(plan.mode) || typeof plan.allowSending !== "boolean")
+    throw Error("Invalid scan mode.");
+  if (
+    !Array.isArray(plan.checks) ||
+    !plan.checks.length ||
+    plan.checks.length > 64 ||
+    new Set(plan.checks).size !== plan.checks.length
+  )
+    throw Error("Select 1–64 unique checks.");
+  for (const id of plan.checks) {
+    const check = getScanCheck(id);
+    if (plan.mode === "passive" && check.active)
+      throw Error("Active checks require active scan mode.");
+  }
+  if (
+    !Array.isArray(plan.parameters) ||
+    plan.parameters.length > 10 ||
+    new Set(plan.parameters.map(parameterKey)).size !== plan.parameters.length
+  )
+    throw Error("Select at most 10 unique parameters.");
+  for (const parameter of plan.parameters) {
+    if (!["query", "json", "form"].includes(parameter.kind))
+      throw Error("Unsupported scan parameter.");
+    mutateParameter(plan.request, parameter, "scan_validation");
+  }
+  for (const [n, min, max] of [
+    [plan.baselineSamples, 2, 3],
+    [plan.rate, 1, 20],
+    [plan.delay, 0, 60000],
+  ] as const)
+    if (!Number.isInteger(n) || n < min || n > max)
+      throw Error("Invalid baseline or rate controls.");
+  if (
+    !plan.diffOptions ||
+    !Array.isArray(plan.diffOptions.ignoredHeaders) ||
+    !Array.isArray(plan.diffOptions.ignoredPaths) ||
+    [...plan.diffOptions.ignoredHeaders, ...plan.diffOptions.ignoredPaths].some(
+      (v) => typeof v !== "string" || v.length > 200,
+    ) ||
+    plan.diffOptions.ignoredHeaders.length > 50 ||
+    plan.diffOptions.ignoredPaths.length > 50
+  )
+    throw Error("Invalid response comparison options.");
+  if (plan.mode !== "passive" && !plan.allowSending)
+    throw Error("Active scanning requires explicit sending permission.");
+  if (
+    (plan.mode === "both" && !plan.observed) ||
+    (plan.mode === "passive" && !plan.observed && !plan.allowSending)
+  )
+    throw Error("Passive scanning requires an existing response or permission to fetch it once.");
+  if (plan.observed)
+    validateResponse({
+      ...plan.observed.response,
+      duration: plan.observed.duration ?? 0,
+      size:
+        plan.observed.size ?? new TextEncoder().encode(plan.observed.response.responseBody).length,
+      ...(plan.observed.setCookies && { setCookies: plan.observed.setCookies }),
+    });
+  const { observed: _, ...config } = plan;
+  if (new TextEncoder().encode(JSON.stringify(config)).length > 500000)
+    throw Error("Scan configuration exceeds 500 KB.");
+}
+function validateResponse(response: ScanResponse) {
+  if (
+    !Number.isInteger(response.status) ||
+    response.status < 100 ||
+    response.status > 599 ||
+    typeof response.responseBody !== "string" ||
+    new TextEncoder().encode(response.responseBody).length > 2_000_000 ||
+    !response.responseHeaders ||
+    typeof response.responseHeaders !== "object" ||
+    Object.keys(response.responseHeaders).length > 200 ||
+    new TextEncoder().encode(JSON.stringify(response.responseHeaders)).length > 256000 ||
+    (response.setCookies !== undefined &&
+      (!Array.isArray(response.setCookies) ||
+        response.setCookies.length > 1000 ||
+        new TextEncoder().encode(JSON.stringify(response.setCookies)).length > 256000)) ||
+    Array.isArray(response.responseHeaders) ||
+    Object.values(response.responseHeaders).some((v) => typeof v !== "string") ||
+    !Number.isFinite(response.duration) ||
+    response.duration < 0 ||
+    response.duration > 3600000 ||
+    !Number.isInteger(response.size) ||
+    response.size < 0 ||
+    response.size > 2_000_000 ||
+    response.setCookies?.some((v) => typeof v !== "string")
+  )
+    throw Error("Invalid or oversized scan response.");
+}
+export interface ScanDependencies {
+  hostHeader?: (input: {
+    request: HttpRequest;
+    header: "host" | "x-forwarded-host";
+    host: string;
+    timeoutMs: number;
+  }) => Promise<({ ok: true } & ScanResponse) | { ok: false; error: string }>;
+  dependencies?: import("./types").ScanCheckContext["dependencies"];
+  protocol?: (input: {
+    url: string;
+    variant: import("./types").ProtocolVariant;
+    timeoutMs: number;
+  }) => Promise<import("./types").ProtocolResponse | { ok: false; error: string }>;
+  oast?: Pick<import("./types").OastClient, "issue" | "poll" | "publishKey">;
+  browser?: (input: {
+    url: string;
+    body: string;
+    headers: Record<string, string>;
+    marker: string;
+    resources?: import("./types").BrowserResource[];
+    interaction?: import("./types").BrowserInteraction;
+  }) => Promise<Omit<import("./types").BrowserObservation, "marker" | "url">>;
+  send: (
+    request: HttpRequest,
+    options?: { timeoutMs: number },
+  ) => Promise<({ ok: true } & ScanResponse) | { ok: false; error: string }>;
+  allowCrawlUrl?: (url: string) => boolean;
+  /** Endpoints already extracted from captured JavaScript by the automatic audit. */
+  jsEndpoints?: () => Promise<DiscoveredEndpoint[]>;
+  isCurrent: () => boolean;
+  onChange?: (run: ScanRun) => void;
+  /** Called once, after execution. Retrying persistence must not repeat HTTP. */
+  save?: (run: ScanRun) => Promise<void>;
+  receive?: (url: string, cookies: string[]) => void;
+  allowScriptOrigin?: (url: string) => boolean;
+}
+class Halt extends Error {}
+export class ScanEngine {
+  private crawlChild: ScanEngine | undefined;
+  private endpointChild: ScanEngine | undefined;
+  private state: ScanRun;
+  private original: ScanPlan;
+  private started = false;
+  private cancelled = false;
+  private paused = false;
+  private nextTime = 0;
+  private wakeups = new Set<() => void>();
+  private saveError = "";
+  private scripts = new Map<string, Promise<Exchange>>();
+  private jwtResources = new Map<string, Promise<Exchange>>();
+  constructor(
+    plan: ScanPlan,
+    private deps: ScanDependencies,
+    profile?: { id: string; name: string },
+  ) {
+    validateScanPlan(plan);
+    this.original = structuredClone(plan);
+    const { observed: _, ...snapshot } = this.original;
+    this.state = {
+      version: 1,
+      id: flowId(),
+      startedAt: new Date().toISOString(),
+      status: "running",
+      message: "",
+      plan: snapshot,
+      sent: 0,
+      bytes: 0,
+      baselineStable: null,
+      baselineIds: [],
+      evidence: [],
+      findings: [],
+      checks: [],
+      ...(profile && { profileId: profile.id, profileName: profile.name }),
+    };
+  }
+  /** Snapshot protects evidence from accidental mutation by consumers. */
+  get run() {
+    return structuredClone(this.state);
+  }
+  get active() {
+    return this.started && ["running", "paused"].includes(this.state.status);
+  }
+  get persistenceError() {
+    return this.saveError;
+  }
+  private emit(patch: Partial<ScanRun> = {}) {
+    this.state = { ...this.state, ...patch };
+    this.deps.onChange?.(this.run);
+  }
+  private wake() {
+    for (const wake of [...this.wakeups]) wake();
+  }
+  private wait(ms: number) {
+    return new Promise<void>((resolve) => {
+      const wake = () => {
+        clearTimeout(timer);
+        this.wakeups.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, Math.max(1, Math.min(1000, ms)));
+      this.wakeups.add(wake);
+    });
+  }
+  stop() {
+    if (this.started && this.active) {
+      this.crawlChild?.stop();
+      this.endpointChild?.stop();
+      this.cancelled = true;
+      this.paused = false;
+      this.wake();
+    }
+  }
+  pause() {
+    if (this.active && !this.cancelled) {
+      this.crawlChild?.pause();
+      this.endpointChild?.pause();
+      this.paused = true;
+      this.emit({ status: "paused" });
+      this.wake();
+    }
+  }
+  resume() {
+    if (this.active && this.paused && !this.cancelled) {
+      this.crawlChild?.resume();
+      this.endpointChild?.resume();
+      this.paused = false;
+      this.emit({ status: "running" });
+      this.wake();
+    }
+  }
+  private guard() {
+    if (
+      this.started &&
+      Date.now() - Date.parse(this.state.startedAt) >=
+        (this.original.policy ?? defaultScanPolicy).maxDurationMs
+    )
+      throw new Halt("Scan duration limit reached; remaining checks are incomplete.");
+    if (this.cancelled || !this.deps.isCurrent())
+      throw new Halt("Stopped. In-flight requests may still complete on the server.");
+  }
+  private async ready() {
+    while (true) {
+      this.guard();
+      if (!this.paused) return;
+      await this.wait(1000);
+    }
+  }
+  private async capture(
+    request: HttpRequest,
+    label: string,
+    response?: ScanResponse,
+    error?: string,
+  ): Promise<Exchange> {
+    const headers: Record<string, string> = {};
+    let headerBytes = 0,
+      truncated = false;
+    for (const [key, value] of Object.entries(response?.responseHeaders ?? {})) {
+      const bytes = new TextEncoder().encode(JSON.stringify([key, value])).length;
+      if (headerBytes + bytes > 32000) {
+        truncated = true;
+        continue;
+      }
+      headers[key] = value;
+      headerBytes += bytes;
+    }
+    const cookies: string[] = [];
+    let cookieBytes = 0;
+    for (const cookie of response?.setCookies ?? []) {
+      const bytes = new TextEncoder().encode(JSON.stringify(cookie)).length;
+      if (cookieBytes + bytes > 16000) {
+        truncated = true;
+        continue;
+      }
+      cookies.push(cookie);
+      cookieBytes += bytes;
+    }
+    if ((response?.responseBody.length ?? 0) > 32000) truncated = true;
+    const digest =
+      response && globalThis.crypto?.subtle
+        ? await crypto.subtle
+            .digest("SHA-256", new TextEncoder().encode(response.responseBody))
+            .catch(() => null)
+        : null;
+    const evidence: ScanEvidence = {
+      id: flowId(),
+      label,
+      timestamp: new Date().toISOString(),
+      request: structuredClone(request),
+      duration: response?.duration ?? 0,
+      size: response?.size ?? 0,
+      setCookies: cookies,
+      truncated,
+      ...(response && {
+        response: {
+          status: response.status,
+          responseHeaders: headers,
+          responseBody: response.responseBody.slice(0, 32000),
+        },
+      }),
+      ...(error && { error }),
+      ...(digest && {
+        bodyHash: Array.from(new Uint8Array(digest), (v) => v.toString(16).padStart(2, "0")).join(
+          "",
+        ),
+      }),
+    };
+    const bytes = new TextEncoder().encode(JSON.stringify(evidence)).length;
+    if (this.state.bytes + bytes > 8_000_000) throw new Halt("Scan evidence budget reached.");
+    this.emit({ evidence: [...this.state.evidence, evidence], bytes: this.state.bytes + bytes });
+    return { evidence, ...(response && { response }) };
+  }
+  private probe = async (
+    request: HttpRequest,
+    label: string,
+    allowMethodProbe = false,
+    receiveCookies = true,
+    passiveFetch = false,
+    scriptResource = false,
+    protocolVariant?: import("./types").ProtocolVariant,
+    businessReadback = false,
+    crawlResource = false,
+    hostOverride?: { header: "host" | "x-forwarded-host"; host: string },
+    /** The URL-override check reaches a denied path through the origin root, so it may GET "/". */
+    allowRootGet = false,
+  ): Promise<Exchange> => {
+    if (
+      !this.original.allowSending ||
+      (this.original.mode === "passive" &&
+        !crawlResource &&
+        (!passiveFetch ||
+          !!this.original.observed ||
+          (this.state.sent > 0 && !this.original.crawlBeforeScan)))
+    )
+      throw Error("This scan cannot send requests.");
+    validateFinalRequest(request);
+    if (this.original.crawlBeforeScan && this.deps.allowCrawlUrl?.(request.url) === false)
+      throw new Halt("Crawl scan target is outside Target Scope.");
+    // Probes stay on the selected origin/path. Only the method-policy check may use OPTIONS/TRACE.
+    const origin = new URL(this.original.request.url),
+      target = new URL(request.url);
+    if (
+      crawlResource
+        ? !this.original.crawlBeforeScan ||
+          request.method !== "GET" ||
+          request.body !== "" ||
+          origin.origin !== target.origin ||
+          this.deps.allowCrawlUrl?.(target.href) === false
+        : businessReadback
+          ? request.method !== "GET" ||
+            request.body !== "" ||
+            target.href !== new URL(this.original.businessReadback!.url).href ||
+            origin.origin !== target.origin
+          : scriptResource
+            ? request.method !== "GET" ||
+              request.body !== "" ||
+              (origin.origin !== target.origin && !this.deps.allowScriptOrigin?.(target.href))
+            : origin.origin !== target.origin ||
+              (origin.pathname !== target.pathname &&
+                !(allowRootGet && target.pathname === "/" && request.method === "GET" && request.body === "")) ||
+              (request.method !== this.original.request.method &&
+                !(allowRootGet && target.pathname === "/" && request.method === "GET") &&
+                !(allowMethodProbe && ["OPTIONS", "TRACE"].includes(request.method)))
+    )
+      throw Error("Scan probes must stay on the selected endpoint and method.");
+    await this.ready();
+    const reserve = new TextEncoder().encode(JSON.stringify(request)).length + 512000;
+    if (this.state.bytes + reserve > 8_000_000)
+      throw new Halt("Scan evidence budget reached; no further requests were sent.");
+    while (this.nextTime > Date.now()) {
+      await this.wait(this.nextTime - Date.now());
+      await this.ready();
+    }
+    await this.ready();
+    const policy = this.original.policy ?? defaultScanPolicy;
+    const remaining = policy.maxDurationMs - (Date.now() - Date.parse(this.state.startedAt));
+    if (remaining < 1000)
+      throw new Halt("Scan duration limit reached; less than one second remains for a request.");
+    const timeoutMs = Math.min(policy.requestTimeoutMs, remaining);
+    this.nextTime = Date.now() + Math.max(1000 / this.original.rate, this.original.delay);
+    this.emit({ sent: this.state.sent + 1 });
+    let response: ScanResponse;
+    let raw: import("./types").ProtocolResponse | undefined;
+    try {
+      const protocol =
+        protocolVariant && this.deps.protocol
+          ? await this.deps.protocol({
+              url: request.url,
+              variant: protocolVariant,
+              timeoutMs: Math.min(timeoutMs, 10000),
+            })
+          : undefined;
+      if (protocol?.ok) {
+        if (
+          typeof protocol.rawRequest !== "string" ||
+          protocol.rawRequest.length > 16000 ||
+          typeof protocol.rawResponse !== "string" ||
+          protocol.rawResponse.length > 32000
+        )
+          throw Error("Invalid raw protocol evidence");
+        raw = protocol;
+      }
+      const sent = protocol
+        ? protocol.ok
+          ? { ...protocol, responseHeaders: {}, responseBody: protocol.rawResponse, setCookies: [] }
+          : protocol
+        : hostOverride
+          ? await this.deps.hostHeader!({
+              request: structuredClone(request),
+              ...hostOverride,
+              timeoutMs,
+            })
+          : await this.deps.send(structuredClone(request), { timeoutMs });
+      if (!sent.ok) return await this.capture(request, label, undefined, sent.error);
+      validateResponse(sent);
+      response = sent;
+    } catch (error) {
+      if (error instanceof Halt) throw error;
+      return this.capture(
+        request,
+        label,
+        undefined,
+        error instanceof Error ? error.message : "Request failed",
+      );
+    }
+    const exchange = await this.capture(request, label, response);
+    if (raw) {
+      const bytes = new TextEncoder().encode(raw.rawRequest + raw.rawResponse).length;
+      if (this.state.bytes + bytes > 8_000_000) throw new Halt("Scan evidence budget reached.");
+      exchange.evidence = {
+        ...exchange.evidence,
+        rawRequest: raw.rawRequest,
+        rawResponse: raw.rawResponse,
+      };
+      this.emit({
+        bytes: this.state.bytes + bytes,
+        evidence: this.state.evidence.map((e) =>
+          e.id === exchange.evidence.id ? exchange.evidence : e,
+        ),
+      });
+    }
+    if (receiveCookies && !this.cancelled && this.deps.isCurrent())
+      this.deps.receive?.(request.url, response.setCookies ?? []);
+    return exchange;
+  };
+  private parametersForCheck(id: string): (import("./types").ScanParameter | undefined)[] {
+    if (id === "business-negative" || id === "business-dates") {
+      const kind = id === "business-negative" ? "number" : "date";
+      return scanParameters(this.original.request).filter(
+        (p) => businessKind(this.original, p) === kind,
+      );
+    }
+    return getScanCheck(id).perParameter ? this.original.parameters : [undefined];
+  }
+  private addResult(result: CheckResult, findings: Finding[] = []) {
+    this.emit({
+      checks: [...this.state.checks, result],
+      findings: [
+        ...this.state.findings,
+        ...findings.filter(
+          (f) => !this.state.findings.some((old) => old.fingerprint === f.fingerprint),
+        ),
+      ],
+    });
+  }
+  private async crawlBeforeScan() {
+    const allowed = (url: string) => this.deps.allowCrawlUrl?.(url) !== false;
+    const pages = await crawl(
+      this.original.request,
+      this.original.crawlOptions ?? { maxUrls: 20, maxDepth: 2 },
+      (request, label) =>
+        this.probe(request, label, false, false, false, false, undefined, false, true),
+      allowed,
+      (fetched, queued, urls) =>
+        this.emit({
+          message: `Crawling: ${fetched}/${queued} URLs fetched`,
+          crawl: { phase: "crawling", fetched, queued, urls },
+        }),
+    );
+    this.emit({
+      crawl: {
+        phase: "scanning",
+        fetched: pages.length,
+        queued: pages.length,
+        urls: pages.map((p) => p.request.url),
+      },
+      message: `Crawl complete: ${pages.length} URLs; scanning discovered endpoints`,
+    });
+    for (const page of pages) {
+      await this.ready();
+      if (!allowed(page.request.url)) continue;
+      if (
+        page.request.url === new URL(this.original.request.url).href &&
+        this.original.request.method === "GET" &&
+        !this.original.request.body
+      ) {
+        if (page.exchange.response)
+          this.original.observed = {
+            response: page.exchange.response,
+            setCookies: page.exchange.response.setCookies ?? [],
+            duration: page.exchange.response.duration,
+            size: page.exchange.response.size,
+          };
+        continue;
+      }
+      if (!page.exchange.response || page.exchange.evidence.error) continue;
+      const {
+        businessReadback: _readback,
+        observed: _observed,
+        crawlOptions: _limits,
+        ...settings
+      } = this.original;
+      if (this.state.bytes + 256000 > 8_000_000)
+        throw new Halt("Crawl scan evidence budget reached.");
+      const base = this.run;
+      const child = new ScanEngine(
+        {
+          ...settings,
+          crawlBeforeScan: false,
+          request: page.request,
+          observed: {
+            response: page.exchange.response,
+            setCookies: page.exchange.response.setCookies ?? [],
+            duration: page.exchange.response.duration,
+            size: page.exchange.response.size,
+          },
+          parameters: scanParameters(page.request).slice(0, 10),
+        },
+        {
+          ...this.deps,
+          isCurrent: () => !this.cancelled && this.deps.isCurrent() && allowed(page.request.url),
+          send: async (request, options) => {
+            await this.ready();
+            if (!allowed(request.url)) throw new Halt("Crawl scan target is outside Target Scope.");
+            if (
+              this.state.bytes + new TextEncoder().encode(JSON.stringify(request)).length + 512000 >
+              8_000_000
+            )
+              throw new Halt("Crawl scan evidence budget reached.");
+            while (this.nextTime > Date.now()) {
+              await this.wait(this.nextTime - Date.now());
+              await this.ready();
+            }
+            this.nextTime = Date.now() + Math.max(1000 / this.original.rate, this.original.delay);
+            return this.deps.send(request, options);
+          },
+          ...(this.deps.hostHeader && {
+            hostHeader: async (input) => {
+              await this.ready();
+              if (!allowed(input.request.url))
+                throw new Halt("Crawl scan target is outside Target Scope.");
+              if (
+                this.state.bytes +
+                  new TextEncoder().encode(JSON.stringify(input.request)).length +
+                  512000 >
+                8_000_000
+              )
+                throw new Halt("Crawl scan evidence budget reached.");
+              while (this.nextTime > Date.now()) {
+                await this.wait(this.nextTime - Date.now());
+                await this.ready();
+              }
+              this.nextTime = Date.now() + Math.max(1000 / this.original.rate, this.original.delay);
+              return this.deps.hostHeader!(input);
+            },
+          }),
+          onChange: (run) =>
+            this.emit({
+              sent: base.sent + run.sent,
+              bytes: base.bytes + run.bytes,
+              evidence: [...base.evidence, ...run.evidence],
+              findings: [...base.findings, ...run.findings],
+              checks: [...base.checks, ...run.checks],
+              domAudits: [...(base.domAudits ?? []), ...(run.domAudits ?? [])],
+              message: `Scanning crawled endpoint: ${page.request.url}${run.message ? " — " + run.message : ""}`,
+            }),
+          save: async () => {},
+        },
+        this.state.profileId
+          ? { id: this.state.profileId, name: this.state.profileName ?? "" }
+          : undefined,
+      );
+      this.crawlChild = child;
+      const completed = await child.start();
+      this.crawlChild = undefined;
+      if (completed.status === "stopped") throw new Halt(completed.message);
+    }
+    this.emit({
+      message: "Crawl complete; scanning original request",
+      crawl: { ...this.state.crawl!, phase: "scanning" },
+    });
+  }
+  /**
+   * Active follow-up for endpoints already extracted from captured JavaScript.
+   * Phase 1 rediscovers hidden inputs and anonymous access on the endpoint itself; phase 2 runs the
+   * profile's per-parameter checks on the inputs phase 1 confirmed.
+   */
+  private async scanJsEndpoints() {
+    const allowed = (url: string) => this.deps.allowCrawlUrl?.(url) !== false;
+    const candidates = (await this.deps.jsEndpoints?.()) ?? [];
+    const limit = Math.max(1, Math.min(20, this.original.jsEndpointOptions?.maxEndpoints ?? 10));
+    const seen = new Set<string>();
+    const targets: DiscoveredEndpoint[] = [];
+    for (const candidate of candidates) {
+      let url: URL;
+      try {
+        url = new URL(candidate.url);
+      } catch {
+        continue;
+      }
+      if (!["http:", "https:"].includes(url.protocol) || url.username || url.password) continue;
+      url.hash = "";
+      const key = `${candidate.method.toUpperCase()} ${url.href}`;
+      if (seen.has(key) || !allowed(url.href)) continue;
+      seen.add(key);
+      targets.push({
+        method: candidate.method,
+        url: url.href,
+        ...(candidate.source && { source: candidate.source }),
+      });
+      if (targets.length >= limit) break;
+    }
+    if (!targets.length) {
+      this.emit({
+        message: "No JavaScript endpoint candidates were available for follow-up scanning",
+      });
+      return;
+    }
+    this.emit({ message: `Scanning ${targets.length} JavaScript endpoint candidate(s)` });
+    const baseOrigin = new URL(this.original.request.url).origin;
+    for (const target of targets) {
+      await this.ready();
+      const request = this.endpointRequest(target, baseOrigin);
+      if (!request) continue;
+      const settings = this.endpointSettings(request);
+      const discovery = await this.runEndpointChild(
+        {
+          ...settings,
+          policy: this.discoveryPolicy(),
+          checks: ["hidden-parameters", "auth-access"],
+        },
+        request.url,
+        `Hidden parameters and anonymous access: ${request.method} ${request.url}`,
+      );
+      const discovered = discoveredParameters(discovery.findings);
+      if (!discovered.length) continue;
+      const augmented = discovered.reduce(
+        (next, item) => withDiscoveredParameter(next, item.channel, item.name),
+        request,
+      );
+      const names = new Set(discovered.map((item) => item.name));
+      const parameters = scanParameters(augmented)
+        .filter((parameter) =>
+          parameter.kind === "json"
+            ? names.has(parameter.pointer.replace(/^\//, ""))
+            : names.has(parameter.name),
+        )
+        .slice(0, 10);
+      if (!parameters.length) continue;
+      const selected = this.original.checks.filter((id) => getScanCheck(id).perParameter);
+      const fallback: CheckId[] = ["reflection", "open-redirect"];
+      const checks = [...new Set(selected.length ? selected : fallback)];
+      await this.runEndpointChild(
+        { ...settings, request: augmented, checks, parameters },
+        request.url,
+        `Discovered parameters: ${request.method} ${request.url}`,
+      );
+    }
+    this.emit({ message: `JavaScript endpoint follow-up complete: ${targets.length} endpoint(s)` });
+  }
+  private endpointSettings(request: HttpRequest): ScanPlan {
+    const {
+      observed: _observed,
+      crawlBeforeScan: _crawl,
+      crawlOptions: _crawlOptions,
+      businessReadback: _readback,
+      jsEndpointScan: _scan,
+      jsEndpointOptions: _options,
+      ...settings
+    } = this.original;
+    return {
+      ...settings,
+      mode: "active",
+      allowSending: true,
+      request,
+      checks: ["hidden-parameters"],
+      parameters: [],
+    };
+  }
+  /** Discovery is intrusive and experimental; the explicit endpoint option is the opt-in. */
+  private discoveryPolicy(): NonNullable<ScanPlan["policy"]> {
+    return {
+      ...(this.original.policy ?? defaultScanPolicy),
+      maxImpact: "intrusive",
+      allowIntrusive: true,
+      includeExperimental: true,
+    };
+  }
+  /** Endpoint requests keep the session's authentication only on the captured origin. */
+  private endpointRequest(endpoint: DiscoveredEndpoint, baseOrigin: string): HttpRequest | undefined {
+    const method = ["GET", "POST", "PUT", "PATCH"].includes(endpoint.method.toUpperCase())
+      ? endpoint.method.toUpperCase()
+      : "GET";
+    const sameOrigin = new URL(endpoint.url).origin === baseOrigin;
+    const base: HttpRequest = {
+      method,
+      url: endpoint.url,
+      headers: { ...this.original.request.headers },
+      body: "",
+    };
+    const headers = sameOrigin ? base.headers : withoutCredentials(base).request.headers;
+    for (const name of Object.keys(headers)) {
+      const lower = name.toLowerCase();
+      if (
+        ["host", "content-length", "content-type", "connection", "transfer-encoding", "expect"].includes(
+          lower,
+        ) ||
+        (!sameOrigin && (["origin", "referer"].includes(lower) || lower.startsWith("sec-")))
+      )
+        delete headers[name];
+    }
+    return { method, url: endpoint.url, headers, body: "" };
+  }
+  private async runEndpointChild(
+    plan: ScanPlan,
+    endpointUrl: string,
+    label: string,
+  ): Promise<ScanRun> {
+    const endpointOrigin = new URL(endpointUrl).origin;
+    const allowed = (url: string) => {
+      try {
+        if (new URL(url).origin !== endpointOrigin) return false;
+      } catch {
+        return false;
+      }
+      return this.deps.allowCrawlUrl?.(url) !== false;
+    };
+    const { receive: _receive, ...inherited } = this.deps;
+    const base = this.run;
+    const child = new ScanEngine(
+      plan,
+      {
+        ...inherited,
+        isCurrent: () => !this.cancelled && this.deps.isCurrent() && allowed(endpointUrl),
+        send: async (request, options) => {
+          await this.ready();
+          if (!allowed(request.url))
+            throw new Halt("JavaScript endpoint scan stayed outside the endpoint origin.");
+          if (
+            this.state.bytes +
+              new TextEncoder().encode(JSON.stringify(request)).length +
+              512000 >
+            8_000_000
+          )
+            throw new Halt("JavaScript endpoint evidence budget reached.");
+          while (this.nextTime > Date.now()) {
+            await this.wait(this.nextTime - Date.now());
+            await this.ready();
+          }
+          this.nextTime = Date.now() + Math.max(1000 / this.original.rate, this.original.delay);
+          return this.deps.send(request, options);
+        },
+        ...(this.deps.hostHeader && {
+          hostHeader: async (input) => {
+            await this.ready();
+            if (!allowed(input.request.url))
+              throw new Halt("JavaScript endpoint scan target is outside the endpoint origin.");
+            while (this.nextTime > Date.now()) {
+              await this.wait(this.nextTime - Date.now());
+              await this.ready();
+            }
+            this.nextTime = Date.now() + Math.max(1000 / this.original.rate, this.original.delay);
+            return this.deps.hostHeader!(input);
+          },
+        }),
+        onChange: (run) =>
+          this.emit({
+            sent: base.sent + run.sent,
+            bytes: base.bytes + run.bytes,
+            evidence: [...base.evidence, ...run.evidence],
+            findings: [...base.findings, ...run.findings],
+            checks: [...base.checks, ...run.checks],
+            domAudits: [...(base.domAudits ?? []), ...(run.domAudits ?? [])],
+            message: `${label}${run.message ? " — " + run.message : ""}`,
+          }),
+        save: async () => {},
+      },
+      this.state.profileId
+        ? { id: this.state.profileId, name: this.state.profileName ?? "" }
+        : undefined,
+    );
+    this.endpointChild = child;
+    const completed = await child.start();
+    this.endpointChild = undefined;
+    if (completed.status === "stopped") throw new Halt(completed.message);
+    return completed;
+  }
+  async start(): Promise<ScanRun> {
+    if (this.started) throw Error("This scan engine has already started.");
+    this.started = true;
+    this.emit();
+    const baselines: Exchange[] = [];
+    try {
+      if (this.original.crawlBeforeScan) await this.crawlBeforeScan();
+      if (this.original.jsEndpointScan) await this.scanJsEndpoints();
+      if (this.original.mode === "passive") {
+        this.guard();
+        const observed = this.original.observed;
+        if (!observed)
+          baselines.push(
+            await this.probe(this.original.request, "Passive response fetch", false, true, true),
+          );
+        else
+          baselines.push(
+            await this.capture(this.original.request, "Observed response", {
+              ...observed.response,
+              setCookies: observed.setCookies ?? [],
+              duration: observed.duration ?? 0,
+              size:
+                observed.size ?? new TextEncoder().encode(observed.response.responseBody).length,
+            }),
+          );
+      } else if (
+        !this.original.checks.every((id) =>
+          policyReason(id, this.original.policy ?? defaultScanPolicy),
+        )
+      )
+        for (let i = 0; i < this.original.baselineSamples; i++)
+          baselines.push(await this.probe(this.original.request, `Baseline ${i + 1}`));
+      let observedBaseline: Exchange[] | undefined;
+      if (this.original.mode === "both" && this.original.observed) {
+        const observed = this.original.observed;
+        observedBaseline = [
+          await this.capture(this.original.request, "Observed response", {
+            ...observed.response,
+            setCookies: observed.setCookies ?? [],
+            duration: observed.duration ?? 0,
+            size: observed.size ?? new TextEncoder().encode(observed.response.responseBody).length,
+          }),
+        ];
+      }
+      const stable =
+        baselines.length >= 2 &&
+        baselines.every((e) => !!e.response) &&
+        baselines.slice(1).every((e) => {
+          const diff = compareResponses(
+            baselines[0]!.response!,
+            e.response!,
+            this.original.diffOptions,
+          );
+          return !diff.statusChanged && !diff.bodyChanged;
+        });
+      this.emit({
+        baselineStable: baselines.length >= 2 ? stable : null,
+        baselineIds: baselines.map((e) => e.evidence.id),
+      });
+      if (this.original.mode !== "both" && baselines.some((e) => !e.response))
+        throw Error(
+          this.original.mode === "passive"
+            ? "Could not fetch a response. Passive audit was not performed."
+            : "A baseline request failed. No active checks were performed.",
+        );
+      for (const id of this.original.checks) {
+        const check = getScanCheck(id),
+          parameters = this.parametersForCheck(id);
+        const blocked = policyReason(id, this.original.policy ?? defaultScanPolicy);
+        if (blocked) {
+          this.addResult({ checkId: id, status: "skipped", message: blocked, findingIds: [] });
+          continue;
+        }
+        if (this.original.mode === "both" && check.active && baselines.some((e) => !e.response)) {
+          this.addResult({
+            checkId: id,
+            status: "inconclusive",
+            message: "Active baseline failed; captured passive evidence remains available.",
+            findingIds: [],
+          });
+          continue;
+        }
+        if (!parameters.length) {
+          this.addResult({
+            checkId: id,
+            status: "skipped",
+            message: id.startsWith("business-")
+              ? "No matching numeric/date scalar values detected."
+              : "No explicit parameters selected.",
+            findingIds: [],
+          });
+          continue;
+        }
+        for (const parameter of parameters) {
+          await this.ready();
+          const common = {
+            endpoint: this.original.request.url,
+            checkId: id,
+            ...(parameter && { parameter }),
+          };
+          try {
+            const output = await check.run({
+              ...(id === "host-header" &&
+                this.deps.hostHeader && {
+                  probeHost: (
+                    request: HttpRequest,
+                    header: "host" | "x-forwarded-host",
+                    host: string,
+                    label: string,
+                  ) =>
+                    this.probe(
+                      withHeader(request, header, host),
+                      label,
+                      false,
+                      false,
+                      false,
+                      false,
+                      undefined,
+                      false,
+                      false,
+                      { header, host },
+                    ),
+                }),
+              ...(check.active &&
+                this.deps.oast && {
+                  oast: {
+                    ...(this.deps.oast.publishKey && {
+                      publishKey: async (material: {
+                        kind: "jwks" | "certificate";
+                        body: string;
+                      }) => {
+                        await this.ready();
+                        const probe = await this.deps.oast!.publishKey!(material);
+                        this.guard();
+                        return probe;
+                      },
+                    }),
+                    issue: async () => {
+                      await this.ready();
+                      const probe = await this.deps.oast!.issue();
+                      this.guard();
+                      return probe;
+                    },
+                    poll: async (probe: import("./types").OastProbe, exchange?: Exchange) => {
+                      await this.ready();
+                      const observation = await this.deps.oast!.poll(probe);
+                      this.guard();
+                      if (observation.id !== probe.id || observation.url !== probe.url)
+                        throw Error("OAST callback correlation failed.");
+                      if (exchange) {
+                        const previous = this.state.evidence
+                          .find((e) => e.id === exchange.evidence.id)
+                          ?.oast?.find((p) => p.id === probe.id);
+                        const bytes =
+                          new TextEncoder().encode(JSON.stringify(observation)).length -
+                          (previous
+                            ? new TextEncoder().encode(JSON.stringify(previous)).length
+                            : 0);
+                        if (this.state.bytes + bytes > 8_000_000)
+                          throw new Halt("Scan evidence budget reached.");
+                        this.emit({
+                          bytes: this.state.bytes + bytes,
+                          evidence: this.state.evidence.map((e) =>
+                            e.id === exchange.evidence.id
+                              ? {
+                                  ...e,
+                                  oast: [
+                                    ...(e.oast ?? []).filter((p) => p.id !== probe.id),
+                                    observation,
+                                  ],
+                                }
+                              : e,
+                          ),
+                        });
+                      }
+                      return observation;
+                    },
+                    wait: async (ms: number) => {
+                      const end = Date.now() + ms;
+                      while (Date.now() < end) {
+                        await this.ready();
+                        await this.wait(end - Date.now());
+                      }
+                      await this.ready();
+                    },
+                  },
+                }),
+              ...(["dom-xss", "dom-interaction"].includes(id) &&
+                check.active && {
+                  loadScript: (raw: string) => {
+                    const target = new URL(raw),
+                      origin = new URL(this.original.request.url);
+                    target.hash = "";
+                    if (
+                      !["http:", "https:"].includes(target.protocol) ||
+                      target.username ||
+                      target.password ||
+                      (target.origin !== origin.origin &&
+                        !this.deps.allowScriptOrigin?.(target.href))
+                    )
+                      throw Error(
+                        "Script is outside the selected origin and configured Target Scope.",
+                      );
+                    const url = target.href;
+                    if (!this.scripts.has(url)) {
+                      const headers =
+                        target.origin === origin.origin
+                          ? Object.fromEntries(
+                              Object.entries(this.original.request.headers).filter(
+                                ([key]) =>
+                                  ![
+                                    "content-length",
+                                    "content-type",
+                                    "host",
+                                    "origin",
+                                    "referer",
+                                    "range",
+                                    "if-none-match",
+                                    "if-modified-since",
+                                    "x-http-method-override",
+                                    "x-method-override",
+                                    "x-http-method",
+                                    "x-original-url",
+                                    "x-rewrite-url",
+                                  ].includes(key.toLowerCase()) &&
+                                  !key.toLowerCase().startsWith("sec-"),
+                              ),
+                            )
+                          : {};
+                      this.scripts.set(
+                        url,
+                        this.probe(
+                          { method: "GET", url, headers, body: "" },
+                          "DOM audit script",
+                          false,
+                          false,
+                          false,
+                          true,
+                        ),
+                      );
+                    }
+                    return this.scripts.get(url)!;
+                  },
+                  recordDomAudit: (audit: import("./dom-audit").DomAudit) => {
+                    this.guard();
+                    const previous = this.state.domAudits?.find((a) => a.id === audit.id);
+                    const bytes =
+                      new TextEncoder().encode(JSON.stringify(audit)).length -
+                      (previous ? new TextEncoder().encode(JSON.stringify(previous)).length : 0);
+                    if (this.state.bytes + bytes > 8_000_000)
+                      throw new Halt("Scan evidence budget reached.");
+                    this.emit({
+                      bytes: this.state.bytes + bytes,
+                      domAudits: [
+                        ...(this.state.domAudits ?? []).filter((a) => a.id !== audit.id),
+                        structuredClone(audit),
+                      ],
+                    });
+                  },
+                }),
+              ...(check.active &&
+                this.deps.browser && {
+                  browser: async (
+                    exchange: Exchange,
+                    marker: string,
+                    url?: string,
+                    resources?: import("./types").BrowserResource[],
+                    interaction?: import("./types").BrowserInteraction,
+                    prototypeProperty?: string,
+                  ) => {
+                    await this.ready();
+                    if (!exchange.response) throw Error("No HTML response for browser validation.");
+                    if (
+                      (this.state.evidence.find((e) => e.id === exchange.evidence.id)?.browser
+                        ?.length ?? 0) >= 500
+                    )
+                      throw new Halt(
+                        "Browser evidence limit reached; remaining paths are incomplete.",
+                      );
+                    const observation = {
+                      ...(await this.deps.browser!({
+                        url: url ?? exchange.evidence.request.url,
+                        body: exchange.response.responseBody,
+                        headers: exchange.response.responseHeaders,
+                        marker,
+                        ...(resources && { resources }),
+                        ...(interaction && { interaction }),
+                      })),
+                      marker,
+                      url: url ?? exchange.evidence.request.url,
+                    };
+                    this.guard();
+                    const bytes = new TextEncoder().encode(JSON.stringify(observation)).length;
+                    if (this.state.bytes + bytes > 8_000_000)
+                      throw new Halt("Scan evidence budget reached.");
+                    this.emit({
+                      bytes: this.state.bytes + bytes,
+                      evidence: this.state.evidence.map((e) =>
+                        e.id === exchange.evidence.id
+                          ? { ...e, browser: [...(e.browser ?? []), observation] }
+                          : e,
+                      ),
+                    });
+                    return observation;
+                  },
+                }),
+              ...(id === "http-framing" &&
+                check.active &&
+                this.deps.protocol && {
+                  protocol: (variant: import("./types").ProtocolVariant, label: string) => {
+                    if (this.original.request.method !== "GET")
+                      throw Error("Protocol framing diagnostics require GET.");
+                    return this.probe(
+                      {
+                        ...withoutCredentials(this.original.request).request,
+                        headers: {},
+                        body: "",
+                      },
+                      label,
+                      false,
+                      false,
+                      false,
+                      false,
+                      variant,
+                    );
+                  },
+                }),
+              ...(id === "dependency-audit" &&
+                this.deps.dependencies && {
+                  dependencies: async (name: string, version: string) => {
+                    await this.ready();
+                    const value = await this.deps.dependencies!(name, version);
+                    this.guard();
+                    const bytes = new TextEncoder().encode(JSON.stringify(value)).length;
+                    if (bytes > 100000 || this.state.bytes + bytes > 8_000_000)
+                      throw new Halt("Dependency advisory evidence budget reached.");
+                    this.emit({ bytes: this.state.bytes + bytes });
+                    return value;
+                  },
+                }),
+              ...(this.original.jwtPublicKey && { jwtPublicKey: this.original.jwtPublicKey }),
+              ...(id === "jwt-confusion" &&
+                check.active && {
+                  loadJwtResource: (raw: string) => {
+                    const url = new URL(raw);
+                    if (
+                      url.origin !== new URL(this.original.request.url).origin ||
+                      url.username ||
+                      url.password ||
+                      url.hash
+                    )
+                      throw Error("JWT discovery must stay on the selected origin.");
+                    if (!this.jwtResources.has(url.href)) {
+                      if (this.jwtResources.size >= 4)
+                        throw Error("JWT discovery resource limit reached.");
+                      this.jwtResources.set(
+                        url.href,
+                        this.probe(
+                          {
+                            method: "GET",
+                            url: url.href,
+                            headers: { Accept: "application/json" },
+                            body: "",
+                          },
+                          "JWT public-key discovery",
+                          false,
+                          false,
+                          false,
+                          true,
+                        ),
+                      );
+                    }
+                    return this.jwtResources.get(url.href)!;
+                  },
+                }),
+              ...(id.startsWith("business-") &&
+                this.original.businessReadback && {
+                  businessReadback: this.original.businessReadback,
+                  readBusiness: (label: string) =>
+                    this.probe(
+                      {
+                        method: "GET",
+                        url: this.original.businessReadback!.url,
+                        headers: {
+                          ...Object.fromEntries(
+                            Object.entries(this.original.request.headers).filter(
+                              ([key]) =>
+                                !/^(?:content-type|content-length|host|if-.*|range|cache-control|pragma|x-http-method-override|x-method-override|x-http-method|x-original-url|x-rewrite-url)$/i.test(
+                                  key,
+                                ),
+                            ),
+                          ),
+                          "Cache-Control": "no-cache, no-store",
+                          Pragma: "no-cache",
+                        },
+                        body: "",
+                      },
+                      label,
+                      false,
+                      false,
+                      false,
+                      false,
+                      undefined,
+                      true,
+                    ),
+                }),
+              request: structuredClone(this.original.request),
+              baselines: !check.active && observedBaseline ? observedBaseline : baselines,
+              stable,
+              diffOptions: this.original.diffOptions,
+              ...(parameter && { parameter }),
+              ...(this.original.nucleiTemplates && {
+                nucleiTemplates: this.original.nucleiTemplates,
+              }),
+              probe: check.active
+                ? (request, label) =>
+                    this.probe(
+                      request,
+                      label,
+                      id === "http-methods",
+                      ![
+                        "auth-access",
+                        "referer-access",
+                        "client-ip",
+                        "http-methods",
+                        "jwt-signature",
+                        "jwt-confusion",
+                        "jwt-jwk",
+                        "jwt-jku",
+                        "jwt-x5u",
+                        "jwt-kid",
+                      ].includes(id),
+                      false,
+                      false,
+                      undefined,
+                      false,
+                      false,
+                      undefined,
+                      id === "url-override",
+                    )
+                : async () => {
+                    throw Error("Passive checks cannot send requests.");
+                  },
+              nonce: () => `scan${flowId().replace(/[^a-zA-Z0-9]/g, "")}`,
+            });
+            const endpoint = new URL(this.original.request.url);
+            const findings = output.findings
+              .filter((f, i, all) => all.findIndex((other) => other.title === f.title) === i)
+              .map((f) => ({
+                ...f,
+                id: flowId(),
+                endpoint: this.original.request.url,
+                method: this.original.request.method,
+                ...(baselines[0] && { baselineId: baselines[0].evidence.id }),
+                checkId: id,
+                ...(parameter && { parameter }),
+              ...(this.original.nucleiTemplates && {
+                nucleiTemplates: this.original.nucleiTemplates,
+              }),
+                fingerprint: JSON.stringify([
+                  this.original.request.method,
+                  endpoint.origin,
+                  endpoint.pathname,
+                  id,
+                  parameter ? parameterKey(parameter) : "",
+                  f.title,
+                ]),
+              }));
+            this.addResult(
+              {
+                ...common,
+                status: output.inconclusive
+                  ? "inconclusive"
+                  : findings.length
+                    ? "findings"
+                    : "passed",
+                message: output.message,
+                findingIds: findings.map((f) => f.id),
+              },
+              findings,
+            );
+          } catch (error) {
+            this.addResult({
+              ...common,
+              status: "inconclusive",
+              message: error instanceof Error ? error.message : "Check failed",
+              findingIds: [],
+            });
+            if (error instanceof Halt) throw error;
+          }
+        }
+      }
+      this.guard();
+      this.emit({
+        status: "completed",
+        finishedAt: new Date().toISOString(),
+        ...(this.state.crawl && {
+          crawl: { ...this.state.crawl, phase: "completed" },
+          message: `Crawl and scan completed: ${this.state.crawl.fetched} URLs fetched`,
+        }),
+      });
+    } catch (error) {
+      this.emit({
+        status: error instanceof Halt ? "stopped" : "failed",
+        message: error instanceof Error ? error.message : "Scan failed",
+        finishedAt: new Date().toISOString(),
+      });
+    }
+    for (const id of this.original.checks) {
+      const check = getScanCheck(id);
+      for (const parameter of this.parametersForCheck(id)) {
+        if (
+          !this.state.checks.some(
+            (r) =>
+              r.checkId === id &&
+              (!r.endpoint || r.endpoint === this.original.request.url) &&
+              (r.parameter ? parameterKey(r.parameter) : "") ===
+                (parameter ? parameterKey(parameter) : ""),
+          )
+        )
+          this.addResult({
+            checkId: id,
+            ...(parameter && { parameter }),
+            status: "skipped",
+            message: "Scan ended before this check completed.",
+            findingIds: [],
+          });
+      }
+    }
+    await this.retrySave();
+    return this.run;
+  }
+  async retrySave() {
+    if (["running", "paused"].includes(this.state.status))
+      throw Error("Cannot save an unfinished scan.");
+    if (!this.deps.save) return;
+    try {
+      await this.deps.save(this.run);
+      this.saveError = "";
+    } catch (error) {
+      this.saveError = error instanceof Error ? error.message : "Could not save scan evidence";
+    }
+  }
+}
+
+function discoveredParameters(
+  findings: Finding[],
+): { channel: "query" | "body"; name: string }[] {
+  const found = new Map<string, { channel: "query" | "body"; name: string }>();
+  for (const finding of findings) {
+    if (finding.checkId !== "hidden-parameters") continue;
+    const channel = finding.excerpts
+      .map((excerpt) => /^Channel: (query|body)$/.exec(excerpt)?.[1])
+      .find((value): value is "query" | "body" => value === "query" || value === "body");
+    const name = finding.excerpts
+      .map((excerpt) => /^Name: ([A-Za-z][\w-]{0,63})$/.exec(excerpt)?.[1])
+      .find((value): value is string => !!value);
+    if (!channel || !name) continue;
+    found.set(`${channel}:${name}`, { channel, name });
+  }
+  return [...found.values()].slice(0, 10);
+}
+/** Adds a discovered name so the regular parameter checks can mutate it. */
+function withDiscoveredParameter(
+  request: HttpRequest,
+  channel: "query" | "body",
+  name: string,
+): HttpRequest {
+  const next = structuredClone(request);
+  if (channel === "query") {
+    const hash = next.url.indexOf("#");
+    const end = hash < 0 ? next.url.length : hash;
+    const head = next.url.slice(0, end);
+    next.url = `${head}${head.includes("?") ? "&" : "?"}${encodeURIComponent(name)}=slurp${next.url.slice(end)}`;
+    return next;
+  }
+  if (isFormRequest(next)) {
+    next.body += `${next.body ? "&" : ""}${encodeURIComponent(name)}=slurp`;
+    return next;
+  }
+  try {
+    const root: unknown = JSON.parse(next.body);
+    if (root && typeof root === "object" && !Array.isArray(root)) {
+      Object.defineProperty(root, name, {
+        value: "slurp",
+        enumerable: true,
+        writable: true,
+        configurable: true,
+      });
+      next.body = JSON.stringify(root);
+    }
+  } catch {
+    /* Not a JSON body; the discovered name cannot be added. */
+  }
+  return next;
+}

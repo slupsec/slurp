@@ -1,0 +1,338 @@
+//! Stateless browser Replay sender. Callers own workspace persistence and script execution.
+use axum::Json;
+use serde_json::{json, Value};
+use std::time::{Duration, Instant};
+
+pub(crate) fn validate(data: &Value) -> Result<(reqwest::Url, u64), String> {
+    super::replay::validate_request(data).map_err(|(_, body)| {
+        body.0["error"]
+            .as_str()
+            .unwrap_or("Invalid request")
+            .to_string()
+    })?;
+    let url = reqwest::Url::parse(data["url"].as_str().unwrap()).map_err(|e| e.to_string())?;
+    super::http_target::validate(&url)?;
+    let timeout = data["timeout"]
+        .as_u64()
+        .filter(|n| (1000..=30000).contains(n))
+        .ok_or("Timeout must be between 1000 and 30000 ms")?;
+    Ok((url, timeout))
+}
+fn allowed_header(name: &str) -> bool {
+    let name = name.to_ascii_lowercase();
+    ![
+        "host",
+        "connection",
+        "content-length",
+        "transfer-encoding",
+        "upgrade",
+        "expect",
+        "forwarded",
+        "keep-alive",
+        "te",
+        "trailer",
+    ]
+    .contains(&name.as_str())
+        && !["proxy-", "cf-", "x-forwarded-"]
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+}
+async fn read_response(mut response: reqwest::Response, start: Instant) -> Result<Value, String> {
+    if response
+        .headers()
+        .get("content-encoding")
+        .is_some_and(|v| !v.as_bytes().eq_ignore_ascii_case(b"identity"))
+    {
+        return Err("Unsupported Content-Encoding in response".into());
+    }
+    let status = response.status();
+    let mut headers = serde_json::Map::new();
+    for name in response.headers().keys() {
+        let values: Vec<_> = response
+            .headers()
+            .get_all(name)
+            .iter()
+            .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+            .collect();
+        headers.insert(name.to_string(), json!(values.join(", ")));
+    }
+    let cookies: Vec<_> = response
+        .headers()
+        .get_all("set-cookie")
+        .iter()
+        .map(|v| String::from_utf8_lossy(v.as_bytes()).into_owned())
+        .collect();
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await.map_err(|e| e.to_string())? {
+        if bytes.len() + chunk.len() > 2_000_000 {
+            return Err("Response exceeds the 2 MB limit.".into());
+        }
+        bytes.extend_from_slice(&chunk);
+    }
+    Ok(
+        json!({"ok":true,"status":status.as_u16(),"statusText":status.canonical_reason().unwrap_or(""),
+        "duration":start.elapsed().as_millis() as u64,"size":bytes.len(),"responseHeaders":headers,
+        "setCookies":cookies,"responseBody":String::from_utf8_lossy(&bytes)}),
+    )
+}
+async fn execute(data: &Value, url: reqwest::Url, timeout: u64, host: Option<(&str,&str)>) -> Result<Value, String> {
+    let start = Instant::now();
+    let client = super::http_target::client_options(&url, timeout, host.is_some()).await?;
+    let mut request = client.request(
+        data["method"]
+            .as_str()
+            .unwrap()
+            .parse::<reqwest::Method>()
+            .map_err(|e| e.to_string())?,
+        url.clone(),
+    );
+    for (name, value) in data["headers"].as_object().unwrap() {
+        if allowed_header(name) {
+            request = request.header(name, value.as_str().unwrap());
+        }
+    }
+    if let Some((name,value))=host { request=request.header(name,value); }
+    if !["GET", "HEAD"].contains(&data["method"].as_str().unwrap()) {
+        request = request.body(data["body"].as_str().unwrap().to_string());
+    }
+    read_response(request.send().await.map_err(|e| e.to_string())?, start).await
+}
+pub async fn send(Json(data): Json<Value>) -> Json<Value> {
+    let result = match validate(&data) {
+        Ok((url, timeout)) => {
+            tokio::time::timeout(Duration::from_millis(timeout), execute(&data, url, timeout, None))
+                .await
+                .unwrap_or_else(|_| Err("Request timed out".into()))
+        }
+        Err(error) => Err(error),
+    };
+    Json(result.unwrap_or_else(|error| json!({"ok":false,"error":error})))
+}
+/// Scan-only override: never changes URL, DNS destination, TLS SNI or redirect policy.
+pub(crate) async fn send_host(data:Value, name:&str, host:&str)->Value {
+    if !matches!(name,"host"|"x-forwarded-host") || !host.starts_with("slurp-") || !host.ends_with(".invalid") || host.len()>100 || !host.bytes().all(|c|c.is_ascii_lowercase() || c.is_ascii_digit() || c==b'-' || c==b'.') {
+        return json!({"ok":false,"error":"Invalid scan host override"});
+    }
+    let result=match validate(&data) {
+        Ok((url,timeout))=>tokio::time::timeout(Duration::from_millis(timeout),execute(&data,url,timeout,Some((name,host)))).await.unwrap_or_else(|_|Err("Request timed out".into())),
+        Err(e)=>Err(e),
+    };
+    result.unwrap_or_else(|error|json!({"ok":false,"error":error}))
+}
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[tokio::test]
+    async fn scan_host_override_stays_on_original_socket() {
+        use axum::{routing::get, Router, http::HeaderMap};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let app = Router::new().route("/probe", get(|headers: HeaderMap| async move {
+            (axum::http::StatusCode::FOUND, [("location", "http://slurp-redirect.invalid/never")],
+                format!("{}|{}", headers["host"].to_str().unwrap(), headers.get("x-forwarded-host").and_then(|v|v.to_str().ok()).unwrap_or("")))
+        }));
+        let server = tokio::spawn(async move {axum::serve(listener, app).await.unwrap();});
+        let input = json!({"method":"GET","url":format!("http://{addr}/probe"),"headers":{"Host":"fake.invalid","X-Forwarded-Host":"fake.invalid"},"body":"","timeout":2000});
+        let normal = send(Json(input.clone())).await.0;
+        assert_eq!(normal["responseBody"],format!("{addr}|"));
+        for header in ["host", "x-forwarded-host"] {
+            let response = send_host(input.clone(),header,"slurp-probe.invalid").await;
+            assert_eq!(response["status"],302);
+            assert_eq!(response["responseBody"],if header=="host" {"slurp-probe.invalid|".to_string()}else{format!("{addr}|slurp-probe.invalid")});
+        }
+        for (name, host) in [("authorization","slurp-probe.invalid"),("host","example.com"),("host","slurp-a.invalid\r\nx: y")] {
+            assert_eq!(send_host(input.clone(),name,host).await["ok"],false);
+        }
+        server.abort();
+    }
+    #[tokio::test]
+    async fn sends_local_post_and_preserves_redirects_on_custom_ports() {
+        use axum::{routing::{get, post}, Router};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let app = Router::new()
+            .route("/login", post(|body: String| async move { body }))
+            .route("/redirect", get(|| async {
+                (axum::http::StatusCode::FOUND, [("location", "/must-not-follow")], "redirect")
+            }));
+        let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap(); });
+        for host in ["127.0.0.1", "localhost"] {
+            let result = send(Json(json!({"method":"POST","url":format!("http://{host}:{port}/login"),"headers":{"Content-Type":"application/json"},"body":"{\"email\":\"local\"}","timeout":2000}))).await.0;
+            assert_eq!(result["ok"], true, "{result}");
+            assert_eq!(result["status"], 200);
+            assert_eq!(result["responseBody"], "{\"email\":\"local\"}");
+        }
+        let result = send(Json(json!({"method":"GET","url":format!("http://127.0.0.1:{port}/redirect"),"headers":{},"body":"","timeout":2000}))).await.0;
+        assert_eq!(result["status"], 302);
+        assert_eq!(result["responseBody"], "redirect");
+        server.abort();
+    }
+    #[tokio::test]
+    async fn sends_options_trace_and_keeps_forwarding_header_restrictions() {
+        use axum::{http::{HeaderMap, Method}, routing::any, Router};
+        let listener=tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address=listener.local_addr().unwrap();
+        let app=Router::new().route("/probe",any(|method:Method,headers:HeaderMap|async move {
+            assert!(!headers.contains_key("x-forwarded-for"));
+            assert!(!headers.contains_key("forwarded"));
+            if method==Method::OPTIONS { return ([("allow","GET, OPTIONS, TRACE")],"options".to_string()); }
+            assert_eq!(method,Method::TRACE);
+            ([("allow","GET, OPTIONS, TRACE")],format!("TRACE /probe HTTP/1.1\r\nX-Slurp-Probe: {}\r\n",headers["x-slurp-probe"].to_str().unwrap()))
+        }));
+        let server=tokio::spawn(async move {axum::serve(listener,app).await.unwrap();});
+        for method in ["OPTIONS","TRACE"] {
+            let data=json!({"method":method,"url":format!("http://{address}/probe"),"headers":{"X-Slurp-Probe":"fixture-marker","X-Forwarded-For":"127.0.0.1","Forwarded":"for=127.0.0.1"},"body":"","timeout":2000});
+            let result=send(Json(data)).await.0;
+            assert_eq!(result["ok"],true,"{result}");
+            assert_eq!(result["status"],200);
+            if method=="TRACE" {assert!(result["responseBody"].as_str().unwrap().contains("fixture-marker"));}
+        }
+        assert!(validate(&json!({"method":"CONNECT","url":format!("http://{address}/probe"),"headers":{},"body":"","timeout":2000})).is_err());
+        server.abort();
+    }
+    #[test]
+    fn accepts_http_local_lan_and_custom_ports_but_rejects_invalid_input() {
+        for url in ["ftp://example.com", "file:///tmp/a", "https://u:p@example.com", "http://localhost:0"] {
+            assert!(validate(&json!({"method":"GET","url":url,"headers":{},"body":"","timeout":1000})).is_err(), "{url}");
+        }
+        for url in ["http://localhost:8088", "http://127.0.0.1:8088", "http://[::1]:8088", "http://192.168.1.20:3000", "https://example.internal:8443", "https://example.com", "http://example.com"] {
+            assert!(validate(&json!({"method":"GET","url":url,"headers":{},"body":"","timeout":1000})).is_ok(), "{url}");
+        }
+        let mut data = json!({"method":"POST","url":"https://example.com","headers":{},"body":"hi","timeout":1000});
+        assert!(validate(&data).is_ok());
+        data["timeout"] = json!(0);
+        assert!(validate(&data).is_err());
+        data["timeout"] = json!(1000);
+        data["headers"] = json!({"x-test":"x\r\ny: z"});
+        assert!(validate(&data).is_err());
+        assert!(!allowed_header("X-Forwarded-For"));
+        assert!(!allowed_header("HOST"));
+        assert!(allowed_header("Authorization"));
+        assert!(allowed_header("Cookie"));
+    }
+    #[tokio::test]
+    async fn preserves_redirect_status_duplicate_cookies_and_caps_response_bytes() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        for oversized in [false, true] {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = [0; 4096];
+                let _ = socket.read(&mut request).await;
+                let body = if oversized {
+                    vec![b'x'; 2_000_001]
+                } else {
+                    b"redirect".to_vec()
+                };
+                let headers=format!("HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/must-not-follow\r\nSet-Cookie: a=1; Path=/\r\nSet-Cookie: b=2; Path=/\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",body.len());
+                let _ = socket.write_all(headers.as_bytes()).await;
+                let _ = socket.write_all(&body).await;
+            });
+            let client = reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .build()
+                .unwrap();
+            let response = client.get(format!("http://{addr}")).send().await.unwrap();
+            let result = read_response(response, Instant::now()).await;
+            if oversized {
+                assert!(result.unwrap_err().contains("2 MB"));
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result["status"], 302);
+                assert_eq!(result["responseBody"], "redirect");
+                assert_eq!(result["setCookies"], json!(["a=1; Path=/", "b=2; Path=/"]));
+                assert_eq!(result["size"], 8);
+            }
+            server.await.unwrap();
+        }
+    }
+    #[tokio::test]
+    async fn errors_keep_browser_result_contract() {
+        let result = send(Json(
+            json!({"method":"GET","url":"file:///tmp/test","headers":{},"body":"","timeout":1000}),
+        ))
+        .await
+        .0;
+        assert_eq!(result["ok"], false);
+        assert!(result["error"].is_string());
+    }
+    fn compress(kind: &str, body: &[u8]) -> Vec<u8> {
+        use std::io::Write;
+        match kind {
+            "gzip" => {
+                let mut encoder =
+                    flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(body).unwrap();
+                encoder.finish().unwrap()
+            }
+            "deflate" => {
+                let mut encoder =
+                    flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::default());
+                encoder.write_all(body).unwrap();
+                encoder.finish().unwrap()
+            }
+            "br" => {
+                let mut output = Vec::new();
+                {
+                    let mut encoder = brotli::CompressorWriter::new(&mut output, 4096, 5, 22);
+                    encoder.write_all(body).unwrap();
+                }
+                output
+            }
+            "zstd" => zstd::stream::encode_all(std::io::Cursor::new(body), 1).unwrap(),
+            _ => unreachable!(),
+        }
+    }
+    #[tokio::test]
+    async fn decodes_captured_accept_encoding_and_bounds_decoded_bytes() {
+        let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        for (kind, oversized) in [
+            ("gzip", false),
+            ("br", false),
+            ("deflate", false),
+            ("zstd", false),
+            ("gzip", true),
+        ] {
+            let plain = if oversized {
+                vec![b'x'; 2_000_001]
+            } else {
+                br#"{"message":"plain text response"}"#.to_vec()
+            };
+            let compressed = compress(kind, &plain);
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let mut request = vec![0; 8192];
+                let count = stream.read(&mut request).await.unwrap();
+                assert!(String::from_utf8_lossy(&request[..count])
+                    .to_lowercase()
+                    .contains("accept-encoding: gzip, deflate, br, zstd"));
+                let head=format!("HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Encoding: {kind}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",compressed.len());
+                stream.write_all(head.as_bytes()).await.unwrap();
+                stream.write_all(&compressed).await.unwrap();
+            });
+            let client = reqwest::Client::builder().no_proxy().build().unwrap();
+            let response = client
+                .get(format!("http://{addr}/"))
+                .header("Accept-Encoding", "gzip, deflate, br, zstd")
+                .send()
+                .await
+                .unwrap();
+            let result = read_response(response, Instant::now()).await;
+            if oversized {
+                assert!(result.unwrap_err().contains("2 MB"));
+            } else {
+                let result = result.unwrap();
+                assert_eq!(result["responseBody"], String::from_utf8(plain).unwrap());
+                assert!(result["responseHeaders"].get("content-encoding").is_none());
+            }
+            server.await.unwrap();
+        }
+    }
+}

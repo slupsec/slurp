@@ -1,0 +1,80 @@
+# Rust build output (keep Cargo.lock for reproducible application builds)
+/target/
+**/target/
+
+# Packaged releases and generated frontend assets
+/dist/
+node_modules/
+dist-rust/
+dist-ssr/
+.output/
+.vinxi/
+.tanstack/
+.nitro/
+.wrangler/
+coverage/
+playwright-report/
+test-results/
+*.tsbuildinfo
+
+# Local configuration and secrets (keep example templates)
+/dev.sh
+/SECURITY_REVIEW.md
+/RELEASE.md
+/.local-git-backups/
+.env
+.env.*
+!.env.example
+!.env.sample
+!.env.template
+.dev.vars
+.dev.vars.*
+!.dev.vars.example
+*.local
+
+# Local Slurp data, captured traffic and generated CA material
+.slurp/
+.httpdebugger/
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+ca.key
+ca.crt
+
+# Logs and temporary files
+logs/
+*.log
+*.tmp
+*.temp
+*.bak
+*~
+
+# OS and editor files
+.DS_Store
+._*
+Thumbs.db
+Desktop.ini
+.idea/
+.vscode/*
+!.vscode/extensions.json
+*.swp
+*.swo
+
+# Local management credential
+api-token
+
+# Raw scan benchmark output (curl-cozy/benchmark/RESULTS.md is the committed summary)
+/curl-cozy/benchmark/results/
+
+# Local codebase analysis notes
+/CODEBASE_ANALYSIS.md
+/COMPLETENESS_REVIEW.md
+
+# Local bug bounty research notes
+/BUG_BOUNTY_WRITEUPS.md
+
+# Local analysis exports
+/tmp-analysis.html
